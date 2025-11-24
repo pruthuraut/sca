@@ -2,6 +2,7 @@
 SCA Tool - CLI Version
 Updated to use nvdlib and improved detection logic (same as web app).
 """
+##
 
 from __future__ import annotations
 
