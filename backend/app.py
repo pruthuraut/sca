@@ -5,7 +5,7 @@ import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from git import Repo
-from sca_core import SoftwareCompositionAnalyzer
+from .sca_core import SoftwareCompositionAnalyzer
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
