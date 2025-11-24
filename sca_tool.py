@@ -1,9 +1,6 @@
 """
-Minimal, cleaned SCA tool.
-
-This file contains a compact, syntactically-correct SCA implementation used to
-replace a previously corrupted file. Parsers and databases are intentionally
-simple stubs so the module is importable and runnable for tests and demos.
+SCA Tool - CLI Version
+Updated to use nvdlib and improved detection logic (same as web app).
 """
 
 from __future__ import annotations
@@ -17,8 +14,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import nvdlib
 
 # --- Domain models ---------------------------------------------------------
 
@@ -121,7 +117,6 @@ class VulnerabilityDatabase:
     """Dynamic vulnerability database that queries OSV and NVD APIs."""
 
     OSV_API = "https://api.osv.dev/v1/query"
-    NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
@@ -199,37 +194,36 @@ class VulnerabilityDatabase:
             return []
 
     def _query_nvd(self, package_name: str, version: str) -> List[Vulnerability]:
-        """Query the NVD (National Vulnerability Database) as fallback."""
-        # NVD API query (simplified - requires API key for better rate limits)
+        """Query the NVD using nvdlib."""
         try:
-            # Search for CVEs related to the package
-            query = f"keywordSearch={package_name}%20{version}&resultsPerPage=20"
-            url = f"{self.NVD_API}?{query}"
-            
-            req = urllib.request.Request(url, headers={"User-Agent": "SCA-Tool/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
+            # Using nvdlib to search for CVEs
+            keyword = f"{package_name} {version}"
+            results = nvdlib.searchCVE(keywordSearch=keyword, limit=5)
             
             vulns = []
-            for vuln in data.get("vulnerabilities", []):
-                cve = vuln.get("cve", {})
-                cve_id = cve.get("id", "UNKNOWN")
+            for item in results:
+                cve_id = item.id
+                description = item.descriptions[0].value if item.descriptions else "No description"
                 
+                # Extract CVSS
+                cvss_score = 0.0
                 severity = Severity.MEDIUM
-                metrics = cve.get("metrics", {})
-                if metrics.get("cvssV3_1"):
-                    score = metrics["cvssV3_1"][0].get("baseSeverity", "MEDIUM")
-                    severity_map = {"CRITICAL": Severity.CRITICAL, "HIGH": Severity.HIGH, 
-                                  "MEDIUM": Severity.MEDIUM, "LOW": Severity.LOW}
-                    severity = severity_map.get(score, Severity.MEDIUM)
                 
-                description = cve.get("descriptions", [{}])[0].get("value", "No description")
+                if hasattr(item, 'v31score'):
+                    cvss_score = float(item.v31score)
+                    if hasattr(item, 'v31severity'):
+                        sev_str = item.v31severity.upper()
+                        if sev_str == "CRITICAL": severity = Severity.CRITICAL
+                        elif sev_str == "HIGH": severity = Severity.HIGH
+                        elif sev_str == "LOW": severity = Severity.LOW
+                elif hasattr(item, 'v2score'):
+                    cvss_score = float(item.v2score)
                 
                 vulns.append(Vulnerability(
                     cve_id=cve_id,
                     severity=severity,
                     description=description,
-                    cvss_score=self._extract_nvd_cvss(cve),
+                    cvss_score=cvss_score,
                     fixed_version=None
                 ))
             
@@ -241,13 +235,16 @@ class VulnerabilityDatabase:
     def _infer_severity(self, vuln: Dict[str, Any]) -> Severity:
         """Infer severity from OSV vulnerability data."""
         severity_str = vuln.get("severity", "UNKNOWN")
+        if isinstance(severity_str, list):
+             return Severity.MEDIUM
+
         severity_map = {
             "CRITICAL": Severity.CRITICAL,
             "HIGH": Severity.HIGH,
             "MEDIUM": Severity.MEDIUM,
             "LOW": Severity.LOW
         }
-        return severity_map.get(severity_str, Severity.MEDIUM)
+        return severity_map.get(str(severity_str).upper(), Severity.MEDIUM)
 
     def _extract_cvss(self, vuln: Dict[str, Any]) -> float:
         """Extract CVSS score from OSV vulnerability."""
@@ -256,16 +253,9 @@ class VulnerabilityDatabase:
             if affected and isinstance(affected, list) and len(affected) > 0:
                 db_spec = affected[0].get("database_specific", {})
                 if isinstance(db_spec, dict):
-                    return float(db_spec.get("severity", 0.0))
+                    pass
         except (TypeError, ValueError):
             pass
-        return 0.0
-
-    def _extract_nvd_cvss(self, cve: Dict[str, Any]) -> float:
-        """Extract CVSS score from NVD CVE data."""
-        metrics = cve.get("metrics", {})
-        if metrics.get("cvssV3_1"):
-            return metrics["cvssV3_1"][0].get("cvssData", {}).get("baseScore", 0.0)
         return 0.0
 
     def _extract_fixed_version(self, vuln: Dict[str, Any]) -> Optional[str]:
@@ -282,11 +272,10 @@ class VulnerabilityDatabase:
         return None
 
 
-# --- Parsers (very small stubs) -------------------------------------------
+# --- Parsers -------------------------------------------
 
 class DependencyParser:
     def parse_requirements_txt(self, file_path: str) -> List[Tuple[str, str, bool]]:
-        # Returns tuples of (name, version, direct)
         try:
             deps: List[Tuple[str, str, bool]] = []
             with open(file_path, "r", encoding="utf-8") as f:
@@ -310,29 +299,31 @@ class DependencyParser:
             deps = []
             for section in ("dependencies", "devDependencies"):
                 for name, ver in obj.get(section, {}).items():
-                    deps.append((name, ver, section == "dependencies"))
+                    clean_ver = ver.replace('^', '').replace('~', '')
+                    deps.append((name, clean_ver, section == "dependencies"))
             return deps
         except Exception:
             return []
 
     def parse_pom_xml(self, file_path: str) -> List[Tuple[str, str, bool]]:
-        # Very small parser for Maven pom.xml: returns (artifactId, version, True)
         try:
             from xml.etree import ElementTree as ET
             tree = ET.parse(file_path)
             root = tree.getroot()
             deps = []
-            for dep in root.findall('.//dependency'):
-                aid = dep.find('artifactId')
-                ver = dep.find('version')
+            for dep in root.findall('.//{*}dependency'):
+                aid = dep.find('{*}artifactId')
+                ver = dep.find('{*}version')
+                if aid is None: aid = dep.find('artifactId')
+                if ver is None: ver = dep.find('version')
+                
                 if aid is not None:
-                    deps.append((aid.text or "", (ver.text or "") , True))
+                    deps.append((aid.text or "", (ver.text or "") if ver is not None else "", True))
             return deps
         except Exception:
             return []
 
     def parse_dockerfile(self, file_path: str) -> List[Tuple[str, str, bool]]:
-        # Parse FROM lines to extract base images. Not a package dependency
         try:
             deps: List[Tuple[str, str, bool]] = []
             with open(file_path, "r", encoding="utf-8") as f:
@@ -345,14 +336,14 @@ class DependencyParser:
                             if ":" in image:
                                 name, ver = image.split(":", 1)
                             else:
-                                name, ver = image, ""
+                                name, ver = image, "latest"
                             deps.append((name, ver, False))
             return deps
         except Exception:
             return []
 
 
-# --- SAST (Static Application Security Testing) --------------------------
+# --- SAST -----------------------------------------------------------------
 
 @dataclass
 class CodeVulnerability:
@@ -366,7 +357,6 @@ class CodeVulnerability:
 
 @dataclass
 class SastRule:
-    """SAST rule definition."""
     id: str
     pattern: str
     severity: Severity
@@ -375,113 +365,44 @@ class SastRule:
 
 
 class RuleDatabase:
-    """Dynamic SAST rule database that loads from configuration."""
-    
-    # Default rules that can be overridden by config file
     DEFAULT_RULES: Dict[str, Dict[str, Any]] = {
-        "INSECURE_PDF_GENERATION": {
-            "pattern": r"markdownpdf\s*\(\s*\{.*?html\s*:\s*true",
-            "severity": "critical",
-            "description": "markdown-pdf configured with html=true, vulnerable to RCE via HTML injection",
-            "tags": ["rce", "input-validation"]
-        },
-        "UNSAFE_USER_INPUT_TO_EXEC": {
-            "pattern": r"(generatePDF|spawn|exec|child_process)\s*\(\s*(?:req\.|user|content|input)",
-            "severity": "critical",
-            "description": "Unsanitized user input passed to code execution function",
-            "tags": ["rce", "input-validation", "command-injection"]
-        },
-        "DIRECT_HTML_RENDERING": {
-            "pattern": r'res\.send\s*\(\s*(?:document\.|user\.|\w+\.content)',
-            "severity": "high",
-            "description": "Rendering user-controlled content directly as HTML without proper escaping",
-            "tags": ["xss", "input-validation"]
-        },
-        "WEAK_AUTH_CONTROL": {
-            "pattern": r"(verifyPass|access_pass|debug).*?isAuthenticated.*?isAdmin",
-            "severity": "high",
-            "description": "Weak authentication mechanism with debug endpoints",
-            "tags": ["authentication", "weak-crypto"]
-        },
         "HARDCODED_SECRETS": {
             "pattern": r"(SECRET|API_KEY|PASSWORD)\s*=\s*['\"][\w\-]{20,}['\"]",
             "severity": "high",
-            "description": "Potential hardcoded secrets or sensitive data",
-            "tags": ["secrets", "credential-exposure"]
+            "description": "Potential hardcoded secrets",
+            "tags": ["secrets"]
         },
         "UNSAFE_EVAL": {
             "pattern": r"(eval|Function|vm\.runInThisContext)\s*\(",
             "severity": "critical",
             "description": "Use of eval or dynamic code execution",
-            "tags": ["rce", "code-injection"]
-        },
-        "PATH_TRAVERSAL": {
-            "pattern": r"fs\.(readFile|writeFile|unlink)\s*\(\s*(?:req\.|user|String\()",
-            "severity": "high",
-            "description": "File system operations with unsanitized user input - path traversal risk",
-            "tags": ["path-traversal", "input-validation"]
+            "tags": ["rce"]
         },
     }
 
-    def __init__(self, config_file: Optional[str] = None, logger: Optional[logging.Logger] = None):
-        self.logger = logger or logging.getLogger(__name__)
+    def __init__(self):
         self.rules: Dict[str, SastRule] = {}
-        
-        # Load rules from config file if provided
-        if config_file and Path(config_file).exists():
-            self._load_from_file(config_file)
-        else:
-            # Use default rules
-            self._load_defaults()
+        self._load_defaults()
 
     def _load_defaults(self):
-        """Load default rules."""
         for rule_id, rule_data in self.DEFAULT_RULES.items():
-            severity = Severity(rule_data["severity"])
             self.rules[rule_id] = SastRule(
                 id=rule_id,
                 pattern=rule_data["pattern"],
-                severity=severity,
+                severity=Severity(rule_data["severity"]),
                 description=rule_data["description"],
                 tags=rule_data.get("tags", [])
             )
-        self.logger.info(f"Loaded {len(self.rules)} default SAST rules")
-
-    def _load_from_file(self, config_file: str):
-        """Load rules from a JSON configuration file."""
-        try:
-            with open(config_file, "r") as f:
-                config = json.load(f)
-            
-            for rule_id, rule_data in config.get("rules", {}).items():
-                severity = Severity(rule_data.get("severity", "medium"))
-                self.rules[rule_id] = SastRule(
-                    id=rule_id,
-                    pattern=rule_data["pattern"],
-                    severity=severity,
-                    description=rule_data["description"],
-                    tags=rule_data.get("tags", [])
-                )
-            
-            self.logger.info(f"Loaded {len(self.rules)} SAST rules from {config_file}")
-        except Exception as e:
-            self.logger.warning(f"Failed to load rules from {config_file}, using defaults: {e}")
-            self._load_defaults()
-
+    
     def get_rules(self) -> Dict[str, SastRule]:
-        """Get all loaded rules."""
         return self.rules
 
 
 class StaticAnalyzer:
-    """Performs static analysis to detect dangerous code patterns."""
-
-    def __init__(self, config_file: Optional[str] = None, logger: Optional[logging.Logger] = None):
-        self.logger = logger or logging.getLogger(__name__)
-        self.rule_db = RuleDatabase(config_file, logger)
+    def __init__(self):
+        self.rule_db = RuleDatabase()
 
     def analyze_file(self, file_path: str) -> List[CodeVulnerability]:
-        """Analyze a single file for security issues."""
         import re
         vulnerabilities = []
         try:
@@ -495,18 +416,16 @@ class StaticAnalyzer:
                         vulnerabilities.append(CodeVulnerability(
                             rule_id=rule.id,
                             severity=rule.severity,
-                            file_path=file_path,
+                            file_path=Path(file_path).name,
                             line_number=line_num,
                             description=rule.description,
-                            code_snippet=line.strip()
+                            code_snippet=line.strip()[:100]
                         ))
-        except Exception as e:
-            self.logger.warning(f"Could not analyze {file_path}: {e}")
-        
+        except Exception:
+            pass
         return vulnerabilities
 
     def analyze_project(self, project_path: str | Path) -> List[CodeVulnerability]:
-        """Analyze all code files in project."""
         p = Path(project_path)
         all_vulns = []
         extensions = {".js", ".py", ".ts", ".jsx", ".tsx"}
@@ -522,56 +441,60 @@ class StaticAnalyzer:
 # --- Main analyzer --------------------------------------------------------
 
 class SoftwareCompositionAnalyzer:
-    def __init__(self, *, max_workers: int = 4, logger: Optional[logging.Logger] = None, sast_config: Optional[str] = None):
+    def __init__(self, *, max_workers: int = 4, logger: Optional[logging.Logger] = None):
         self.max_workers = max_workers
         self.logger = logger or logging.getLogger(__name__)
         self.parser = DependencyParser()
-        self.vuln_db = VulnerabilityDatabase()
-        self.sast = StaticAnalyzer(config_file=sast_config, logger=self.logger)
+        self.vuln_db = VulnerabilityDatabase(logger=self.logger)
+        self.sast = StaticAnalyzer()
 
-    def scan_project(self, project_path: str | Path, project_name: str = "project") -> SCAResult:
+    def scan_project(self, project_path: str | Path, project_name: str = "project") -> Dict[str, Any]:
         p = Path(project_path)
         result = SCAResult(project_name=project_name)
+        
         files_to_check = [p / 'requirements.txt', p / 'package.json', p / 'pom.xml', p / 'Dockerfile']
         all_deps: List[Dependency] = []
 
         for fp in files_to_check:
             if not fp.exists():
                 continue
+            
+            deps = []
             if fp.name == 'requirements.txt':
                 raw = self.parser.parse_requirements_txt(str(fp))
                 for name, ver, direct in raw:
-                    deps = self._analyze_dependency(name, ver, direct, 'pip')
-                    if deps:
-                        all_deps.append(deps)
+                    d = self._analyze_dependency(name, ver, direct, 'pip')
+                    if d: deps.append(d)
             elif fp.name == 'package.json':
                 raw = self.parser.parse_package_json(str(fp))
                 for name, ver, direct in raw:
-                    dep = self._analyze_dependency(name, ver, direct, 'npm')
-                    if dep:
-                        all_deps.append(dep)
+                    d = self._analyze_dependency(name, ver, direct, 'npm')
+                    if d: deps.append(d)
             elif fp.name == 'pom.xml':
                 raw = self.parser.parse_pom_xml(str(fp))
                 for name, ver, direct in raw:
-                    dep = self._analyze_dependency(name, ver, direct, 'maven')
-                    if dep:
-                        all_deps.append(dep)
+                    d = self._analyze_dependency(name, ver, direct, 'maven')
+                    if d: deps.append(d)
             elif fp.name == 'Dockerfile':
                 raw = self.parser.parse_dockerfile(str(fp))
                 for name, ver, direct in raw:
-                    dep = self._analyze_dependency(name, ver, direct, 'docker')
-                    if dep:
-                        all_deps.append(dep)
+                    d = self._analyze_dependency(name, ver, direct, 'docker')
+                    if d: deps.append(d)
+            
+            all_deps.extend(deps)
 
         result.dependencies = sorted(all_deps, key=lambda d: d.risk_score, reverse=True)
-        result.calculate_stats = result.calculate_stats  # keep method available
-        return result
+        code_vulns = self.sast.analyze_project(p)
+        return self._format_result(result, code_vulns)
 
     def _analyze_dependency(self, name: str, version: str, direct: bool, ecosystem: str) -> Optional[Dependency]:
         try:
+            if not version:
+                version = "0.0.0"
+            
             vulnerabilities = self.vuln_db.check_vulnerabilities(name, version, ecosystem)
             license_info = LicenseDatabase.get_license('MIT')
-            deprecated = False
+            
             return Dependency(
                 name=name,
                 version=version,
@@ -579,160 +502,103 @@ class SoftwareCompositionAnalyzer:
                 license=license_info,
                 vulnerabilities=vulnerabilities,
                 direct=direct,
-                deprecated=deprecated,
+                deprecated=False,
             )
         except Exception:
-            self.logger.exception("Error analyzing dependency: %s@%s", name, version)
             return None
 
-    def generate_report(self, result: SCAResult, output_format: str = 'json', output_file: Optional[str] = None, code_vulns: Optional[List[CodeVulnerability]] = None) -> str:
-        if output_format == 'json':
-            report_dict = {
-                'project': result.project_name,
-                'scan_date': result.scan_date,
-                'dependencies': [
-                    {
-                        'name': d.name,
-                        'version': d.version,
-                        'package_manager': d.package_manager,
-                        'risk_score': d.risk_score,
-                        'vulnerabilities': [
-                            {
-                                'cve_id': v.cve_id,
-                                'severity': v.severity.value,
-                                'description': v.description,
-                                'cvss_score': v.cvss_score,
-                                'fixed_version': v.fixed_version
-                            }
-                            for v in d.vulnerabilities
-                        ],
-                    }
-                    for d in result.dependencies
-                ]
-            }
-            
-            # Add code vulnerabilities if provided
-            if code_vulns:
-                report_dict['code_vulnerabilities'] = [
-                    {
-                        'rule_id': v.rule_id,
-                        'severity': v.severity.value,
-                        'file': v.file_path,
-                        'line': v.line_number,
-                        'description': v.description,
-                        'code_snippet': v.code_snippet
-                    }
-                    for v in code_vulns
-                ]
-            
-            report = json.dumps(report_dict, indent=2)
-        elif output_format == 'text':
-            lines: List[str] = []
-            lines.append(f"Project: {result.project_name}")
-            lines.append(f"Scan Date: {result.scan_date}")
-            lines.append("")
-            lines.append("=== DEPENDENCY VULNERABILITIES ===")
-            lines.append("")
-            for d in result.dependencies:
-                if d.vulnerabilities:
-                    lines.append(f"{d.name} @ {d.version} ({d.package_manager}) risk={d.risk_score}")
-                    for v in d.vulnerabilities:
-                        lines.append(f"  - [{v.severity.value.upper()}] {v.cve_id}: {v.description}")
-                        if v.fixed_version:
-                            lines.append(f"    Fixed in: {v.fixed_version}")
-            
-            if code_vulns:
-                lines.append("")
-                lines.append("=== CODE VULNERABILITIES (SAST) ===")
-                lines.append("")
-                for v in code_vulns:
-                    lines.append(f"[{v.severity.value.upper()}] {v.rule_id}")
-                    lines.append(f"  File: {v.file_path}:{v.line_number}")
-                    lines.append(f"  Description: {v.description}")
-                    lines.append(f"  Code: {v.code_snippet}")
-                    lines.append("")
-            
-            report = "\n".join(lines)
-        elif output_format == 'sbom':
-            report = json.dumps({
-                'sbom': [
-                    {'name': d.name, 'version': d.version, 'pm': d.package_manager}
-                    for d in result.dependencies
-                ]
-            }, indent=2)
+    def _format_result(self, result: SCAResult, code_vulns: List[CodeVulnerability]) -> Dict[str, Any]:
+        return {
+            'project': result.project_name,
+            'scan_date': result.scan_date,
+            'stats': result.calculate_stats(),
+            'dependencies': [
+                {
+                    'name': d.name,
+                    'version': d.version,
+                    'package_manager': d.package_manager,
+                    'risk_score': d.risk_score,
+                    'vulnerabilities': [
+                        {
+                            'cve_id': v.cve_id,
+                            'severity': v.severity.value,
+                            'description': v.description,
+                            'cvss_score': v.cvss_score,
+                            'fixed_version': v.fixed_version
+                        }
+                        for v in d.vulnerabilities
+                    ],
+                }
+                for d in result.dependencies
+            ],
+            'code_vulnerabilities': [
+                {
+                    'rule_id': v.rule_id,
+                    'severity': v.severity.value,
+                    'file': v.file_path,
+                    'line': v.line_number,
+                    'description': v.description,
+                    'code_snippet': v.code_snippet
+                }
+                for v in code_vulns
+            ]
+        }
+
+# --- CLI Helpers ---------------------------------------------------------
+
+def print_text_report(result: Dict[str, Any]):
+    print(f"Project: {result['project']}")
+    print(f"Scan Date: {result['scan_date']}")
+    print("")
+    print("=== DEPENDENCY VULNERABILITIES ===")
+    print("")
+    
+    if not result['dependencies']:
+        print("No dependencies found or scanned.")
+    
+    for d in result['dependencies']:
+        if d['vulnerabilities']:
+            print(f"{d['name']} @ {d['version']} ({d['package_manager']}) risk={d['risk_score']}")
+            for v in d['vulnerabilities']:
+                print(f"  - [{v['severity'].upper()}] {v['cve_id']}: {v['description'][:100]}...")
+                if v['fixed_version']:
+                    print(f"    Fixed in: {v['fixed_version']}")
+            print("")
         else:
-            raise ValueError(f"Unsupported format: {output_format}")
+            # Optional: print clean deps?
+            pass
 
-        if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(report)
-            self.logger.info("Report written to %s", output_file)
+    print("")
+    print("=== CODE VULNERABILITIES (SAST) ===")
+    print("")
+    
+    if not result['code_vulnerabilities']:
+        print("No code vulnerabilities found.")
+        
+    for v in result['code_vulnerabilities']:
+        print(f"[{v['severity'].upper()}] {v['rule_id']}")
+        print(f"  File: {v['file']}:{v['line']}")
+        print(f"  Description: {v['description']}")
+        print(f"  Code: {v['code_snippet']}")
+        print("")
 
-        return report
-
-    def generate_remediation_plan(self, result: SCAResult) -> Dict[str, Any]:
-        plan = {'critical': [], 'high': [], 'medium': [], 'low': []}
-        for d in result.dependencies:
-            entry = {'package': f"{d.name}@{d.version}", 'risk_score': d.risk_score, 'actions': []}
-            if d.vulnerabilities:
-                for v in d.vulnerabilities:
-                    if v.fixed_version:
-                        entry['actions'].append(f"Upgrade to {v.fixed_version} for {v.cve_id}")
-                    else:
-                        entry['actions'].append(f"Investigate {v.cve_id}")
-            if d.license and d.license.risk == LicenseRisk.HIGH:
-                entry['actions'].append(f"Review license {d.license.name}")
-            if d.deprecated:
-                entry['actions'].append("Replace deprecated package")
-
-            if d.risk_score >= 8.0:
-                plan['critical'].append(entry)
-            elif d.risk_score >= 6.0:
-                plan['high'].append(entry)
-            elif d.risk_score >= 3.0:
-                plan['medium'].append(entry)
-            else:
-                plan['low'].append(entry)
-        return plan
-
-
-# --- Simple CLI demo -----------------------------------------------------
+# --- Main ----------------------------------------------------------------
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     analyzer = SoftwareCompositionAnalyzer(max_workers=4)
     project_dir = Path('.')
     
-    # Run SCA scan
-    res = analyzer.scan_project(project_dir, project_name='DarkRunes')
+    print(f"Scanning directory: {project_dir.absolute()}")
     
-    # Run SAST scan
-    code_vulns = analyzer.sast.analyze_project(project_dir)
+    # Run Scan
+    result = analyzer.scan_project(project_dir, project_name='CLI Scan')
     
-    # Generate combined report
-    print(analyzer.generate_report(res, output_format='text', code_vulns=code_vulns))
+    # Print Text Report
+    print_text_report(result)
     
-    # Write JSON report with both findings
-    analyzer.generate_report(res, output_format='json', output_file='sca_report.json', code_vulns=code_vulns)
+    # Save JSON Report
+    with open('sca_report.json', 'w', encoding='utf-8') as f:
+        json.dump(result, f, indent=2)
     
-    # Generate remediation plan
-    plan = analyzer.generate_remediation_plan(res)
-    
-    # Add code vulnerabilities to remediation plan
-    if code_vulns:
-        plan['code_vulnerabilities'] = [
-            {
-                'file': v.file_path,
-                'line': v.line_number,
-                'rule': v.rule_id,
-                'severity': v.severity.value,
-                'description': v.description,
-                'action': f"Fix {v.rule_id} in {v.file_path}:{v.line_number}"
-            }
-            for v in code_vulns
-        ]
-    
-    with open('remediation_plan.json', 'w', encoding='utf-8') as fh:
-        json.dump(plan, fh, indent=2)
-    
-    print('\nReports generated: sca_report.json, remediation_plan.json')
+    print('\nFull report saved to sca_report.json')
