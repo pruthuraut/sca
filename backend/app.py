@@ -2,9 +2,14 @@ import os
 import shutil
 import tempfile
 import logging
+import sys
+from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from git import Repo
+
+# Add current directory to path to import sca_core
+sys.path.insert(0, str(Path(__file__).parent))
 from sca_core import SoftwareCompositionAnalyzer
 
 app = Flask(__name__)
