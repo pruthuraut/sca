@@ -236,46 +236,158 @@ class VulnerabilityDatabase:
 
     def _infer_severity(self, vuln: Dict[str, Any]) -> Severity:
         """Infer severity from OSV vulnerability data."""
-        severity_str = vuln.get("severity", "UNKNOWN")
-        # Sometimes severity is a list or dict in OSV, but usually it's not the top level field for the string
-        # OSV top level 'severity' is often a list of objects.
-        # But let's check if we can find a string representation.
+        # PRIORITY 1: database_specific.severity (GitHub reviewed - most reliable)
+        db_specific = vuln.get("database_specific", {})
+        if isinstance(db_specific, dict):
+            severity_str = db_specific.get("severity")
+            if severity_str:
+                severity_map = {
+                    "CRITICAL": Severity.CRITICAL,
+                    "HIGH": Severity.HIGH,
+                    "MODERATE": Severity.MEDIUM,
+                    "MEDIUM": Severity.MEDIUM,
+                    "LOW": Severity.LOW
+                }
+                mapped = severity_map.get(str(severity_str).upper())
+                if mapped:
+                    self.logger.debug(f"Using database_specific.severity: {severity_str} -> {mapped.value}")
+                    return mapped
         
-        # If it's a list, try to find CVSS
-        if isinstance(severity_str, list):
-             # Fallback to medium if we can't parse easily here, 
-             # but usually we rely on CVSS extraction for score.
-             return Severity.MEDIUM
-
-        severity_map = {
-            "CRITICAL": Severity.CRITICAL,
-            "HIGH": Severity.HIGH,
-            "MEDIUM": Severity.MEDIUM,
-            "LOW": Severity.LOW
-        }
-        return severity_map.get(str(severity_str).upper(), Severity.MEDIUM)
+        # PRIORITY 2: Try OSV severity list (array of CVSS objects)
+        severities = vuln.get("severity", [])
+        if isinstance(severities, list) and len(severities) > 0:
+            for sev in severities:
+                if isinstance(sev, dict):
+                    # The score is a CVSS vector string like "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+                    # We need to estimate score from the vector metrics
+                    if sev.get("type") in ["CVSS_V3", "CVSS_V2"]:
+                        score = self._estimate_cvss_from_vector(sev.get("score", ""))
+                        if score is not None:
+                            severity = self._severity_from_cvss(score)
+                            self.logger.debug(f"Using CVSS vector estimated score: {score} -> {severity.value}")
+                            return severity
+        
+        # PRIORITY 3: Fallback - check description for severity keywords
+        description = vuln.get("summary", "")
+        if description:
+            desc_lower = description.lower()
+            if any(keyword in desc_lower for keyword in ["critical", "rce", "remote code execution"]):
+                self.logger.debug(f"Using description inference: CRITICAL")
+                return Severity.CRITICAL
+            if any(keyword in desc_lower for keyword in ["xss", "cross-site", "authentication bypass", "injection"]):
+                self.logger.debug(f"Using description inference: HIGH")
+                return Severity.HIGH
+        
+        self.logger.debug(f"Defaulting to MEDIUM severity")
+        return Severity.MEDIUM
 
     def _extract_cvss(self, vuln: Dict[str, Any]) -> float:
         """Extract CVSS score from OSV vulnerability."""
         try:
-            affected = vuln.get("affected", [])
-            if affected and isinstance(affected, list) and len(affected) > 0:
-                db_spec = affected[0].get("database_specific", {})
-                if isinstance(db_spec, dict):
-                    # Some ecosystems put severity here
-                    pass
-            
-            # OSV often puts severity in the top level list
+            # OSV stores severity as a list of objects
             severities = vuln.get("severity", [])
             if isinstance(severities, list):
                 for sev in severities:
-                    if sev.get("type") == "CVSS_V3":
-                        # We would need a CVSS parser to get the score from the vector string
-                        # For now, return 0.0 or try to parse if it's a simple score (unlikely)
-                        pass
+                    if isinstance(sev, dict):
+                        score_str = sev.get("score")
+                        if score_str:
+                            # Handle case where score is a string with vector or direct number
+                            score = self._extract_cvss_score_from_vector(score_str)
+                            if score is not None:
+                                return score
         except (TypeError, ValueError):
             pass
         return 0.0
+    
+    def _extract_cvss_score_from_vector(self, score_input: str | float) -> Optional[float]:
+        """Extract numeric CVSS score from vector string or direct number."""
+        try:
+            # If it's already a number, return it
+            if isinstance(score_input, (int, float)):
+                return float(score_input)
+            
+            # If it's a string, try to parse
+            if isinstance(score_input, str):
+                # Try direct float conversion first
+                try:
+                    return float(score_input)
+                except ValueError:
+                    pass
+                
+                # CVSS vector format: CVSS:3.1/AV:N/AC:L/... with score at end or separate
+                # Some APIs include score after the vector
+                import re
+                # Look for a number in the string
+                match = re.search(r'\d+\.\d+', score_input)
+                if match:
+                    return float(match.group())
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return None
+    
+    def _estimate_cvss_from_vector(self, vector_string: str) -> Optional[float]:
+        """Estimate CVSS score from a vector string by analyzing its metrics.
+        
+        Example vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+        
+        For CVSS v3.x, we estimate based on impact metrics:
+        - C (Confidentiality): N=0, L=0.5, H=2.0
+        - I (Integrity): N=0, L=0.5, H=2.0  
+        - A (Availability): N=0, L=0.5, H=2.0
+        """
+        if not vector_string or not isinstance(vector_string, str):
+            return None
+        
+        try:
+            # Base score for network-accessible vulnerability
+            score = 0.0
+            
+            # Parse confidentiality impact (highest weight for info disclosure)
+            if "/C:H" in vector_string or ",C:H" in vector_string:
+                score += 2.0  # High confidentiality impact -> ~7.5
+            elif "/C:L" in vector_string or ",C:L" in vector_string:
+                score += 1.0
+            
+            # Parse integrity impact
+            if "/I:H" in vector_string or ",I:H" in vector_string:
+                score += 1.5  # High integrity impact
+            elif "/I:L" in vector_string or ",I:L" in vector_string:
+                score += 0.5
+            
+            # Parse availability impact
+            if "/A:H" in vector_string or ",A:H" in vector_string:
+                score += 1.5  # High availability impact
+            elif "/A:L" in vector_string or ",A:L" in vector_string:
+                score += 0.5
+            
+            # If network accessible (most likely for npm packages)
+            if "/AV:N" in vector_string:
+                score += 2.0
+            
+            # Normalize to 0-10 scale
+            score = min(score, 10.0)
+            
+            # Ensure we return a reasonable minimum
+            if score < 2.0 and ("C:H" in vector_string or "I:H" in vector_string or "A:H" in vector_string):
+                score = 7.0  # If any High impact, at least HIGH severity
+            
+            return score if score > 0 else None
+            
+        except (TypeError, ValueError, AttributeError):
+            pass
+        
+        return None
+    
+    def _severity_from_cvss(self, cvss_score: float) -> Severity:
+        """Map CVSS score to severity level."""
+        if cvss_score >= 9.0:
+            return Severity.CRITICAL
+        elif cvss_score >= 7.0:
+            return Severity.HIGH
+        elif cvss_score >= 4.0:
+            return Severity.MEDIUM
+        else:
+            return Severity.LOW
 
     def _extract_fixed_version(self, vuln: Dict[str, Any]) -> Optional[str]:
         """Extract fixed version from OSV vulnerability."""

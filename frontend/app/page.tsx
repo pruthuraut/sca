@@ -211,19 +211,21 @@ export default function Home() {
                           {dep.vulnerabilities.length > 0 ? (
                             <div className="space-y-2">
                               {dep.vulnerabilities.map((v: any, vIdx: number) => (
-                                <div key={vIdx} className="text-sm">
+                                <div key={vIdx} className="text-sm mb-3">
                                   <span
                                     className={`font-bold ${v.severity === 'critical'
                                       ? 'text-red-500'
                                       : v.severity === 'high'
                                         ? 'text-orange-500'
-                                        : 'text-yellow-500'
+                                        : v.severity === 'medium'
+                                          ? 'text-yellow-500'
+                                          : 'text-blue-400'
                                       }`}
                                   >
                                     [{v.severity.toUpperCase()}]
                                   </span>{' '}
                                   <span className="text-gray-300">{v.cve_id}</span>
-                                  <p className="text-xs text-gray-500 mt-1 truncate max-w-xs">
+                                  <p className="text-xs text-gray-400 mt-1 break-words">
                                     {v.description}
                                   </p>
                                 </div>
